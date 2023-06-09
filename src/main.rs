@@ -82,7 +82,7 @@ fn get_forward_lookup_zones() -> Option<Vec<(Domain, String)>> {
             }
         }
         Err(_) => {
-            zones.push(String::from("8.8.8.8"));
+            zones.push(String::from("8.8.8.8:53"));
         }
     }
     let mut result = zones.iter().map(|z | {
@@ -437,7 +437,7 @@ impl Error for DnsError {}
 
 impl Error for DnsErrorType {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Header {
     id: u16,
     flags: u16,
@@ -537,7 +537,7 @@ impl Question {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Answer {
     name: &'static str,
     atype: u16,
@@ -590,11 +590,46 @@ impl Answer {
     }
 
     fn from_bytes(&self, buf: &Vec<u8>, index: usize) -> Result<Self, Box<dyn Error>>{
-        todo!("Implement Answer::from_bytes")
+        let mut i = index;
+        let mut name = String::new();
+        loop {
+            let len = buf[i];
+            if len == 0 {
+                break;
+            }
+            if i != index {
+                name.push('.');
+            }
+            for j in 0..len {
+                name.push(buf[i + j as usize + 1] as char);
+            }
+            i += len as usize + 1;
+        }
+        let atype = u16::from_be_bytes([buf[i + 1], buf[i + 2]]);
+        let aclass = u16::from_be_bytes([buf[i + 3], buf[i + 4]]);
+        let ttl = u32::from_be_bytes([
+            buf[i + 5],
+            buf[i + 6],
+            buf[i + 7],
+            buf[i + 8],
+        ]);
+        let rdlength = u16::from_be_bytes([buf[i + 9], buf[i + 10]]);
+        let mut rdata = Vec::new();
+        for j in 0..rdlength {
+            rdata.push(buf[i + 11 + j as usize]);
+        }
+        Ok(Answer {
+            name: Box::leak(name.into_boxed_str()),
+            atype,
+            aclass,
+            ttl,
+            rdlength,
+            rdata,
+        })
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Response {
     header: Header,
     question: Question,
@@ -614,6 +649,10 @@ impl Response {
 
     fn add_answer(&mut self, answer: Answer) {
         self.answers.push(answer);
+    }
+
+    fn add_answers(&mut self, answers: &mut Vec<Answer>) {
+        self.answers.append(answers);
     }
 
     fn write(&self, buf: &mut Vec<u8>) -> WriteResult {
