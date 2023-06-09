@@ -82,6 +82,9 @@ fn get_forward_lookup_zones() -> Option<Vec<(Domain, String)>> {
             }
         }
         Err(_) => {
+            // Ports required to parse IP addresses as zones
+            // 53 - DNS
+            // 67 - DHCP
             zones.push(String::from("8.8.8.8:53"));
         }
     }
