@@ -1,32 +1,76 @@
-use core::time;
-use std::{error::Error, result::Result, io::Error as IoError, num::ParseIntError, fmt::{Display, Formatter, Result as FmtResult}, vec, env};
-use tokio::{net::UdpSocket, main, spawn};
+use std::{
+    env,
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+    io::Error as IoError,
+    net::{SocketAddr, SocketAddrV6, SocketAddrV4},
+    num::ParseIntError,
+    result::{Result},
+    vec, sync::Arc, f32::consts::E,
+};
+use futures::{channel::mpsc, StreamExt};
+use tokio::net::UdpSocket;
+use socket2::{Domain, Protocol, Socket, Type};
 
 type TokioResult = Result<(), Box<dyn Error>>;
 
-#[main]
+#[tokio::main]
 async fn main() -> TokioResult {
     let tracing_subscriber = tracing_subscriber::fmt::Subscriber::builder()
         .with_max_level(tracing::Level::TRACE)
         .finish();
     tracing::subscriber::set_global_default(tracing_subscriber)?;
-    
-        
-    let listen = spawn(listen_dns());
-    match listen.await {
-        Ok(_) => {
-            tracing::info!("Listen exited");
+
+    tokio::spawn(async move {
+        tracing::info!("Starting UDP Listener (IP4)");
+        let result = listen_dns_ip4().await;
+        match result {
+            Ok(_) => {
+                tracing::info!("UDP Listener (IP4) running");
+            }
+            Err(e) => {
+                tracing::error!("UDP Listener (IP4) exited with error: {}", e);
+            }
         }
-        Err(e) => {
-            tracing::error!("Listen exited with error: {}", e);
+    });
+    tokio::spawn(async move {
+        tracing::info!("Starting UDP Listener (IP6)");
+        let result = listen_dns_ip6().await;
+        match result {
+            Ok(_) => {
+                tracing::info!("UDP Listener (IP6) running");
+            }
+            Err(e) => {
+                tracing::error!("UDP Listener (IP6) exited with error: {}", e);
+            }
         }
+    });
+    tracing::info!("Starting main thread");
+    tracing::info!("Press Enter to exit");
+    tokio::spawn(async move {
+        // watch for enter key, confirm stop and continue if not
+        loop {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            if input.trim() == "" {
+                tracing::info!("Confirm Exit (y?)");
+                // read key
+                let input = console::Term::stdout().read_key().unwrap();
+                if input == console::Key::Char('y') {
+                    tracing::info!("Exiting");
+                    std::process::exit(0);
+                }                
+            }
+        }
+    });
+    loop{
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        tracing::debug!("Main thread sleeping");
     }
-        
     Ok(())
 }
 
-fn get_forward_lookup_zone() -> Option<String> {
-    let mut zone: Option<String> = None;
+fn get_forward_lookup_zones() -> Option<Vec<(Domain, String)>> {
     let mut zones: Vec<String> = Vec::new();
     let forward_lookup_zones = env::var("FORWARD_LOOKUP_ZONES");
     match forward_lookup_zones {
@@ -37,146 +81,361 @@ fn get_forward_lookup_zone() -> Option<String> {
                 zones.push(String::from(zone));
             }
         }
-        Err(e) => {
+        Err(_) => {
             zones.push(String::from("8.8.8.8"));
         }
     }
-    if zones.len() > 0 {
-        zone = Some(zones[0].clone());
+    let mut result = zones.iter().map(|z | {
+        // Match IPV4, IPV6 or Domain name
+        let zone = z.parse::<SocketAddrV4>();
+        match zone {
+            Ok(_) => {
+                tracing::info!("Zone {} is an IP Address", z);
+                (Domain::IPV4, z.to_string())
+            }
+            Err(_) => {
+                let zone = z.parse::<SocketAddrV6>();
+                match zone {
+                    Ok(_) => {
+                        tracing::info!("Zone {} is an IP Address", z);
+                        (Domain::IPV6, z.to_string())
+                    }
+                    Err(_) => {
+                        tracing::warn!("Zone {} is Invalid", z);
+                        (Domain::UNIX, z.to_string())
+                    }
+                }
+            }
+        }
+    }).collect::<Vec<(Domain, String)>>();
+    result.retain(|(d, _)| {
+        match d {
+            &Domain::UNIX => false,
+            _ => true
+        }
+    });
+    if result.len() == 0 {
+        None
+    } else {
+        Some(result)
     }
-    zone
 }
 
-type ListenResult = Result<i32, DnsError>;
+type ListenResult = Result<i32, Box<dyn Error>>;
+
 
 #[tracing::instrument]
-async fn listen_dns() -> ListenResult {
-    let socket: UdpSocket;
-    let socket_result = UdpSocket::bind("127.0.0.1:5300").await;
-    match socket_result {
-        Ok(s) => {
-            tracing::info!("Listening on {}", s.local_addr()?);
-            socket = s;
+async fn listen_dns_ip4() -> ListenResult {
+    tracing::info!("Starting UDP Listener (IP4)");
+    let listener = UdpSocket::bind("0.0.0.0:5300".parse::<SocketAddr>()?).await?;
+    let r = Arc::new(listener);
+    let s = r.clone();
+    let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1_000);
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (size, addr) = r.recv_from(&mut buf).await.expect("Failed to receive");
+            let buf = buf[..size].to_vec();
+            tx.clone().try_send((buf, addr)).expect("Failed to send");
+        }
+    });
+    tokio::spawn(async move {
+        while let Some((bytes, addr)) = rx.next().await {
+            let socket = s.clone();
+            tokio::spawn(async move {
+                let result = process_request(&addr, &bytes).await;
+                match result {
+                    Some(buf) => {
+                        match socket.send_to(&buf, &addr).await {
+                            Ok(_) => {
+                                tracing::info!("Sent response to {}", addr);
+                            }
+                            _ => {
+                                tracing::error!("Failed to send response to {}", addr);
+                            }
+                        }
+                        tracing::info!("Sent response to {}", addr);
+                    }
+                    _ => {
+                        tracing::error!("Failed to send response to {}", addr);
+                    }
+                }
+            });
+        }
+    });
+    
+    Ok(0)
+}
+
+#[tracing::instrument]
+async fn listen_dns_ip6() -> ListenResult{
+    // Set listen address
+    tracing::info!("Starting UDP Listener (IP6)");
+    let listener = get_udp_socket(Domain::IPV6, "[::]:5300")?;
+    
+    let r = Arc::new(listener);
+    let s = r.clone();
+    let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1_000);
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (size, addr) = r.recv_from(&mut buf).await.expect("Failed to receive");
+            let buf = buf[..size].to_vec();
+            tx.clone().try_send((buf, addr)).expect("Failed to send");
+        }
+    });
+    tokio::spawn(async move {
+        while let Some((bytes, addr)) = rx.next().await {
+            let socket = s.clone();
+            tokio::spawn(async move {
+                let result = process_request(&addr, &bytes).await;
+                match result {
+                    Some(buf) => {
+                        match socket.send_to(&buf, &addr).await {
+                            Ok(_) => {
+                                tracing::info!("Sent response to {}", addr);
+                            }
+                            _ => {
+                                tracing::error!("Failed to send response to {}", addr);
+                            }
+                        }
+                        tracing::info!("Sent response to {}", addr);
+                    }
+                    _ => {
+                        tracing::error!("Failed to send response to {}", addr);
+                    }
+                }
+            });
+        }
+    });
+    
+    Ok(0)
+}
+
+fn get_udp_socket(domain: Domain, address: &str) -> Result<UdpSocket, Box<dyn Error>> {
+    let socket = Socket::new(
+        domain,
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    match domain {
+        Domain::IPV4 => {
+            socket.set_only_v6(false)?;
+            socket.bind(&socket2::SockAddr::from(address.parse::<SocketAddr>()?))?;
+        }
+        Domain::IPV6 => {
+            socket.set_only_v6(true)?;
+            socket.bind(&socket2::SockAddr::from(SocketAddrV6::from(address.parse().expect("Invalid IPv6 Address"))))?;
+        }
+        _ => {}
+    }
+    
+    socket.set_nonblocking(true)?;
+    socket.set_ttl(64)?;
+    let std_listener:std::net::UdpSocket =  socket.into();
+    let listener = tokio::net::UdpSocket::from_std(std_listener).expect("Failed to convert to tokio socket");
+    Ok(listener)
+}
+
+async fn process_request(addr: &SocketAddr, bytes: &Vec<u8>) -> Option<Vec<u8>> {
+    let buf = bytes as &[u8];
+    tracing::info!("Received from {}", addr);
+    tracing::debug!("Received: {:?}", buf);
+    let header: Header;
+    let header_result = Header::from_bytes(buf);
+    match header_result {
+        Ok(h) => {
+            tracing::debug!("Header: {:?}", h);
+            header = h;
         }
         Err(e) => {
-            tracing::error!("Failed to bind socket: {}", e);
-            return Ok(1);
-        }        
+            tracing::error!("Failed to parse header: {}", e);
+            return None;
+        }
     }
+    let question: Question;
+    let question_result = Question::from_bytes(buf, header.header_len);
+    match question_result {
+        Ok(q) => {
+            tracing::debug!("Question: {:?}", q);
+            question = q;
+        }
+        Err(e) => {
+            tracing::error!("Failed to parse question: {}", e);
+            return None;
+        }
+    }
+    let mut response = &Response::new(header, question);
 
-    loop {
-        let mut buf = [0; 512];
-        let (size, addr) = socket.recv_from(&mut buf).await?;
-        if size == 0 {
-            continue;
+    response = match get_answer(response).await {
+        Ok(r) => {
+            r
         }
-        tracing::info!("Received {} bytes from {}", size, addr);
-        let buf = &mut buf[..size];
-        tracing::debug!("Received: {:?}", buf);
-        let header: Header;
-        let header_result = Header::from_bytes(buf);
-        match header_result {
-            Ok(h) => {
-                tracing::debug!("Header: {:?}", h);
-                header = h;
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse header: {}", e);
-                continue;
-            }
+        Err(e) => {
+            tracing::error!("Failed to get answer: {}", e);
+            return None;
         }
-        let question: Question;
-        let question_result = Question::from_bytes(buf, header.header_len);
-        match question_result {
-            Ok(q) => {
-                tracing::debug!("Question: {:?}", q);
-                question = q;
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse question: {}", e);
-                continue;
-            }
-        }
-        let mut response = Response::new(header, question);
-        
-        response.add_answer(Answer::new(
-            question.name.clone(),
-            1,
-            1,
-            3600,
-            4,
-            vec![127, 0, 0, 1],
-        ));
-        let mut buf = Vec::with_capacity(512);
-        tracing::debug!("Response: {:?}", response);
-        response.write(&mut buf)?;
-        tracing::debug!("Response Buffer: {:?}", buf);
-        socket.send_to(&buf, addr).await?;
-    }
+    };
+    let mut buf = Vec::with_capacity(512);
+    tracing::debug!("Response: {:?}", response);
+    response.write(&mut buf).expect("msg too big");
+    tracing::debug!("Response Buffer: {:?}", buf);
+    Some(buf.clone())
 }
 
-async fn forward_request(buf: &Vec<u8>, zone: String) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-    let mut result: Vec<u8> = Vec::new();
-    let forward_socket = UdpSocket::bind("127.0.0.1:5301").await?;
-    let mut timeout: u32 = 30;
-    // forward the request to the zone
-    tracing::info!("Forwarding request to {}", zone);
-    forward_socket.send_to(&buf, &zone).await?;
-    while timeout > 0 {
-        let mut receive_buf = [0; 512];
-        let (size, addr) = forward_socket.recv_from(&mut receive_buf).await?;
-        if size == 0 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            timeout -= 1;
-            continue;
-        }
-        tracing::info!("Received {} bytes from {}", size, addr);
-        let receive_buf = &mut receive_buf[..size];
-        tracing::debug!("Received: {:?}", receive_buf);
-        result = receive_buf.to_vec();
-        return Ok(Some(result));
-    }
-    // Timeout
-    tracing::error!("Timeout waiting for response from {}", zone);
-    Ok(None)
-}
+async fn get_answer(response: &Response) -> Result<&Response, Box<dyn Error>> {
+    // TODO - get answer from cache
+    // Get answer from forward lookup
+    Ok(check_forward_zones(response).await?)
     
+    // TODO - get answer from reverse lookup
+}
+
+async fn check_forward_zones(response: &Response) -> Result<&Response, Box<dyn Error>>  {
+    let zones = get_forward_lookup_zones();
+    match zones {
+        Some(z) => {
+            for (domain, zone) in z {
+                let mut buf = Vec::new();
+                response.question.write(&mut buf);
+                let result = forward_lookup(&zone, &buf, domain).await;
+                match result {
+                    Ok(r) => {
+                        tracing::debug!("Forward Lookup Result: {:?}", r);
+                        return Ok(Box::leak(Box::new(r)));
+                    }
+                    Err(e) => {
+                        tracing::error!("Forward Lookup Error: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Err("No Forward Lookup Zones".into())
+}
+
+async fn forward_lookup(zone: &str, buf: &Vec<u8>, domain:Domain) -> Result<Response, Box<dyn Error>> {
+    let socket = get_udp_socket(domain, zone)?;
+    socket.send(buf).await?;
+    let mut buf = [0; 512];
+    let (size, _) = socket.recv_from(&mut buf).await?;
+    let buf = buf[..size].to_vec();
+    let header: Header;
+    let header_result = Header::from_bytes(&buf);
+    match header_result {
+        Ok(h) => {
+            tracing::debug!("Header: {:?}", h);
+            header = h;
+        }
+        Err(e) => {
+            tracing::error!("Failed to parse header: {}", e);
+            return Err(e.into());
+        }
+    }
+    let question: Question;
+    let question_result = Question::from_bytes(&buf, header.header_len);
+    match question_result {
+        Ok(q) => {
+            tracing::debug!("Question: {:?}", q);
+            question = q;
+        }
+        Err(e) => {
+            tracing::error!("Failed to parse question: {}", e);
+            return Err(e.into());
+        }
+    }
+    let mut response = Response::new(header, question);
+    let mut answers: Vec<Answer> = Vec::new();
+    let mut i = response.header.header_len + response.question.question_len;
+    for _ in 0..response.header.ancount {
+        let mut answer: Answer = Answer::new("", 0, 0, 0, 0, Vec::new());
+        let answer_result = answer.from_bytes(&buf, i);
+        match answer_result {
+            Ok(a) => {
+                tracing::debug!("Answer: {:?}", a);
+                answer = a;
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse answer: {}", e);
+                return Err(e.into());
+            }
+        }
+        i += *(&answer.rdlength) as usize;
+        answers.push(answer);
+        
+    }
+    response.answers = answers;
+    Ok(response)
+}
 
 #[derive(Debug)]
-enum DnsError {
+struct DnsError {
+    error_type: DnsErrorType,
+}
+
+#[derive(Debug)]
+enum DnsErrorType {
     Io(IoError),
     Parse(ParseIntError),
     Other(String),
 }
 
-impl From<IoError> for DnsError {
-    fn from(err: IoError) -> Self {
-        DnsError::Io(err)
+impl DnsError {
+    fn new(error_type: DnsErrorType) -> Self {
+        DnsError { error_type }
     }
 }
 
-impl From<ParseIntError> for DnsError {
-    fn from(err: ParseIntError) -> Self {
-        DnsError::Parse(err)
+impl From<DnsErrorType> for DnsError {
+    fn from(error_type: DnsErrorType) -> Self {
+        DnsError::new(error_type)
     }
 }
+
 impl From<&str> for DnsError {
     fn from(err: &str) -> Self {
-        DnsError::Other(String::from(err))
+        DnsError::new(DnsErrorType::Other(String::from(err)))
     }
 }
-    
-impl Display for DnsError {
+
+impl From<IoError> for DnsErrorType {
+    fn from(err: IoError) -> Self {
+        DnsErrorType::Io(err)
+    }
+}
+
+impl From<ParseIntError> for DnsErrorType {
+    fn from(err: ParseIntError) -> Self {
+        DnsErrorType::Parse(err)
+    }
+}
+impl From<&str> for DnsErrorType {
+    fn from(err: &str) -> Self {
+        DnsErrorType::Other(String::from(err))
+    }
+}
+
+impl Display for DnsErrorType {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         match self {
-            DnsError::Io(err) => write!(f, "IO error: {}", err),
-            DnsError::Parse(err) => write!(f, "Parse error: {}", err),
-            DnsError::Other(err) => write!(f, "Dns Error: {}", err),
+            DnsErrorType::Io(err) => write!(f, "IO error: {}", err),
+            DnsErrorType::Parse(err) => write!(f, "Parse error: {}", err),
+            DnsErrorType::Other(err) => write!(f, "Dns Error: {}", err),
         }
+    }
+}
+impl Display for DnsError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "Dns Error: {}", self.error_type)
     }
 }
 
 impl Error for DnsError {}
+
+impl Error for DnsErrorType {}
 
 #[derive(Debug)]
 struct Header {
@@ -213,7 +472,7 @@ impl Header {
 
 #[derive(Debug, Copy, Clone)]
 struct Question {
-    name: & 'static str,
+    name: &'static str,
     qtype: u16,
     qclass: u16,
     question_len: usize,
@@ -222,7 +481,7 @@ struct Question {
 type QuestionResult = Result<Question, DnsError>;
 
 impl Question {
-    fn new (name: & 'static str, qtype: u16, qclass: u16, question_len: usize) -> Self {
+    fn new(name: &'static str, qtype: u16, qclass: u16, question_len: usize) -> Self {
         Question {
             name,
             qtype,
@@ -230,6 +489,7 @@ impl Question {
             question_len: question_len,
         }
     }
+    #[tracing::instrument]
     fn from_bytes(buf: &[u8], offset: usize) -> QuestionResult {
         let mut question_len = offset;
         let mut name = String::new();
@@ -253,7 +513,9 @@ impl Question {
         let qclass = u16::from_be_bytes([buf[i + 3], buf[i + 4]]);
         let name = Box::leak(name.into_boxed_str());
         question_len += 4;
-        Ok(Question::new(name, qtype, qclass, question_len))
+        let question = Question::new(name, qtype, qclass, question_len);
+        tracing::debug!("Question {:?}", &question);
+        Ok(question)
     }
 }
 
@@ -277,7 +539,7 @@ impl Question {
 
 #[derive(Debug)]
 struct Answer {
-    name: & 'static str,
+    name: &'static str,
     atype: u16,
     aclass: u16,
     ttl: u32,
@@ -287,7 +549,7 @@ struct Answer {
 
 impl Answer {
     fn new(
-        name: & 'static str,
+        name: &'static str,
         atype: u16,
         aclass: u16,
         ttl: u32,
@@ -325,6 +587,10 @@ impl Answer {
         buf.push(((self.rdlength >> 8) & 0xff) as u8);
         buf.push((self.rdlength & 0xff) as u8);
         buf.append(&mut self.rdata.clone());
+    }
+
+    fn from_bytes(&self, buf: &Vec<u8>, index: usize) -> Result<Self, Box<dyn Error>>{
+        todo!("Implement Answer::from_bytes")
     }
 }
 
@@ -370,5 +636,5 @@ impl Response {
             answer.write(buf);
         }
         Ok(())
-    }    
+    }
 }
