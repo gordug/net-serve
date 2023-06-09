@@ -6,7 +6,7 @@ use std::{
     net::{SocketAddr, SocketAddrV6, SocketAddrV4},
     num::ParseIntError,
     result::{Result},
-    vec, sync::Arc, f32::consts::E,
+    sync::Arc,
 };
 use futures::{channel::mpsc, StreamExt};
 use tokio::net::UdpSocket;
@@ -67,7 +67,6 @@ async fn main() -> TokioResult {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         tracing::debug!("Main thread sleeping");
     }
-    Ok(())
 }
 
 fn get_forward_lookup_zones() -> Option<Vec<(Domain, String)>> {
@@ -84,7 +83,6 @@ fn get_forward_lookup_zones() -> Option<Vec<(Domain, String)>> {
         Err(_) => {
             // Ports required to parse IP addresses as zones
             // 53 - DNS
-            // 67 - DHCP
             zones.push(String::from("8.8.8.8:53"));
         }
     }
